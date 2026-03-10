@@ -149,14 +149,35 @@ MIT — см. [LICENSE](LICENSE).
 
 ## LLM-анализ (опционально)
 
-Модуль `llm.py` использует OpenAI-совместимый API для генерации рекомендаций по нишам на основе собранных данных:
+Модуль `llm.py` использует [OpenAI SDK](https://github.com/openai/openai-python) для генерации рекомендаций по нишам. Совместим с любым OpenAI-compatible провайдером (OpenAI, OpenRouter, Ollama, vLLM и др.)
 
 ```python
 from market_gap_scanner.llm import LLMAnalyzer, format_recommendations
 
-async with LLMAnalyzer(api_key="sk-...", model="gpt-4o-mini") as llm:
-    recs = await llm.analyze(gaps=gaps, signals=signals)
-    print(format_recommendations(recs))
+# OpenAI
+analyzer = LLMAnalyzer(api_key="sk-...", model="gpt-4o-mini")
+
+# OpenRouter
+analyzer = LLMAnalyzer(
+    api_key="sk-or-...",
+    base_url="https://openrouter.ai/api/v1",
+    model="deepseek/deepseek-chat",
+)
+
+# Ollama (local)
+analyzer = LLMAnalyzer(
+    api_key="ollama",
+    base_url="http://localhost:11434/v1",
+    model="llama3",
+)
+
+recs = analyzer.analyze(gaps=gaps, signals=signals)
+print(format_recommendations(recs))
 ```
 
-Поддерживает любой OpenAI-совместимый провайдер через `base_url`.
+Также поддерживает конфигурацию через переменные окружения:
+```bash
+export OPENAI_API_KEY="sk-..."
+export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+export LLM_MODEL="gpt-4o-mini"
+```

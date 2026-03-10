@@ -1,116 +1,150 @@
-"""LLM-powered analysis of market signals.
+"""LLM-powered market gap analysis.
 
-Uses OpenAI-compatible API to:
-- Summarize market gaps from raw keyword + Reddit data
-- Classify and prioritize opportunities
-- Generate actionable niche recommendations
+Uses OpenAI SDK (compatible with any OpenAI-compatible provider:
+OpenAI, Anthropic via proxy, OpenRouter, vLLM, Ollama, etc.)
+
+Analyzes keyword volumes + Reddit signals to generate
+actionable niche recommendations with confidence scoring.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-import httpx
+from openai import OpenAI
 
-from .analyzer import MarketGap
-from .reddit import RedditSignal
+if TYPE_CHECKING:
+    from .analyzer import MarketGap
+    from .reddit import RedditSignal
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gpt-4o-mini"
-DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
-SYSTEM_PROMPT = """You are a market research analyst. You analyze keyword search volumes 
-and social media signals to identify profitable market niches and gaps.
+SYSTEM_PROMPT = """\
+You are a market research analyst specializing in niche discovery.
 
-Your task: given keyword data (search volumes) and Reddit signals (user discussions), 
-identify the most promising market opportunities. For each opportunity, explain:
-1. What the gap is
-2. Why it exists (evidence from data)
-3. Estimated demand level
-4. Suggested product/service to fill it
+Given keyword search volume data (from Yandex Wordstat) and social media signals \
+(from Reddit), identify the most promising market opportunities.
 
-Be concise and data-driven. Output valid JSON."""
+For each opportunity provide:
+1. Niche name and description
+2. Evidence from the data (specific keywords, discussions)
+3. Demand level assessment (high/medium/low)
+4. Concrete product/service suggestion to fill the gap
+5. Confidence score (0.0-1.0) based on data strength
+
+Focus on niches where demand exists but supply is insufficient. \
+Be specific and data-driven. Avoid generic recommendations."""
+
+ANALYSIS_PROMPT_TEMPLATE = """\
+Analyze these market data sources and identify the top {max_recs} niche opportunities.
+
+## Keyword Data (Yandex Wordstat — monthly search volumes)
+{keyword_section}
+
+## Reddit Signals (user discussions indicating market gaps)
+{reddit_section}
+
+Return a JSON object with this structure:
+{{
+  "recommendations": [
+    {{
+      "niche": "Short niche name",
+      "description": "What the opportunity is and why it exists",
+      "evidence": ["Evidence point 1", "Evidence point 2"],
+      "demand_level": "high|medium|low",
+      "suggested_product": "Specific product/service idea",
+      "confidence": 0.85
+    }}
+  ]
+}}"""
 
 
 @dataclass
 class NicheRecommendation:
     """AI-generated niche recommendation."""
+
     niche: str
     description: str
-    evidence: list[str]
-    demand_level: str  # high, medium, low
-    suggested_product: str
-    confidence: float
+    evidence: list[str] = field(default_factory=list)
+    demand_level: str = "medium"
+    suggested_product: str = ""
+    confidence: float = 0.5
 
 
 class LLMAnalyzer:
-    """LLM-powered market gap analyzer.
+    """Market gap analyzer powered by LLM.
+
+    Works with any OpenAI-compatible API provider.
 
     Args:
-        api_key: OpenAI API key (or compatible provider).
-        base_url: API base URL (for OpenAI-compatible providers).
-        model: Model name to use.
+        api_key: API key. Falls back to OPENAI_API_KEY env var.
+        base_url: API base URL. Falls back to OPENAI_BASE_URL env var.
+            Examples:
+                - https://api.openai.com/v1 (OpenAI)
+                - https://openrouter.ai/api/v1 (OpenRouter)
+                - http://localhost:11434/v1 (Ollama)
+                - http://localhost:8000/v1 (vLLM)
+        model: Model name. Falls back to LLM_MODEL env var.
+
+    Example:
+        >>> analyzer = LLMAnalyzer(api_key="sk-...", model="gpt-4o-mini")
+        >>> recs = analyzer.analyze(gaps=gaps, signals=signals)
+        >>> print(format_recommendations(recs))
     """
 
     def __init__(
         self,
-        api_key: str,
-        base_url: str = DEFAULT_BASE_URL,
-        model: str = DEFAULT_MODEL,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
     ) -> None:
-        self._model = model
-        self._client = httpx.AsyncClient(
-            base_url=base_url,
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=60.0,
+        self._model = model or os.getenv("LLM_MODEL", DEFAULT_MODEL)
+        self._client = OpenAI(
+            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
         )
 
-    async def close(self) -> None:
-        await self._client.aclose()
-
-    async def __aenter__(self) -> LLMAnalyzer:
-        return self
-
-    async def __aexit__(self, *exc) -> None:
-        await self.close()
-
-    async def analyze(
+    def analyze(
         self,
         gaps: list[MarketGap],
         signals: list[RedditSignal] | None = None,
         max_recommendations: int = 5,
     ) -> list[NicheRecommendation]:
-        """Generate niche recommendations from market data.
+        """Generate niche recommendations from collected market data.
 
         Args:
-            gaps: Keyword gap analysis results.
+            gaps: Keyword gap analysis results from Wordstat.
             signals: Optional Reddit signals for richer context.
-            max_recommendations: Max recommendations to generate.
+            max_recommendations: Maximum recommendations to generate.
 
         Returns:
-            List of AI-generated niche recommendations.
+            Sorted list of NicheRecommendation (highest confidence first).
         """
-        user_prompt = self._build_prompt(gaps, signals, max_recommendations)
+        prompt = self._build_prompt(gaps, signals, max_recommendations)
 
-        resp = await self._client.post(
-            "/chat/completions",
-            json={
-                "model": self._model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.3,
-                "response_format": {"type": "json_object"},
-            },
+        logger.info("Calling %s for market analysis...", self._model)
+
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"},
         )
-        resp.raise_for_status()
-        data = resp.json()
 
-        content = data["choices"][0]["message"]["content"]
+        content = response.choices[0].message.content
+        if not content:
+            logger.warning("Empty LLM response")
+            return []
+
         return self._parse_response(content)
 
     @staticmethod
@@ -119,46 +153,76 @@ class LLMAnalyzer:
         signals: list[RedditSignal] | None,
         max_recs: int,
     ) -> str:
-        parts = [f"Analyze these market data and return top {max_recs} niche opportunities as JSON.\n"]
-
-        parts.append("## Keyword Data (Yandex Wordstat)")
+        # Keyword section
+        kw_lines = []
         for g in gaps[:30]:
-            parts.append(f"- \"{g.keyword}\": {g.monthly_shows:,} searches/mo, gap_score={g.gap_score:.1f}")
+            kw_lines.append(
+                f'- "{g.keyword}": {g.monthly_shows:,} searches/mo, '
+                f"gap_score={g.gap_score:.1f}"
+            )
+        keyword_section = "\n".join(kw_lines) if kw_lines else "No keyword data available."
 
+        # Reddit section
+        rd_lines = []
         if signals:
-            parts.append("\n## Reddit Signals")
             for s in signals[:20]:
-                parts.append(f"- [{s.signal_type}] r/{s.subreddit}: \"{s.title}\" (score={s.score}, comments={s.num_comments})")
+                rd_lines.append(
+                    f"- [{s.signal_type}] r/{s.subreddit}: "
+                    f'"{s.title}" (upvotes={s.score}, comments={s.num_comments})'
+                )
+        reddit_section = "\n".join(rd_lines) if rd_lines else "No Reddit signals available."
 
-        parts.append(f'\nReturn JSON: {{"recommendations": [{{"niche": "...", "description": "...", "evidence": ["..."], "demand_level": "high|medium|low", "suggested_product": "...", "confidence": 0.0-1.0}}]}}')
-        return "\n".join(parts)
+        return ANALYSIS_PROMPT_TEMPLATE.format(
+            max_recs=max_recs,
+            keyword_section=keyword_section,
+            reddit_section=reddit_section,
+        )
 
     @staticmethod
     def _parse_response(content: str) -> list[NicheRecommendation]:
-        data = json.loads(content)
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse LLM response as JSON")
+            return []
+
         recs = []
         for item in data.get("recommendations", []):
-            recs.append(NicheRecommendation(
-                niche=item.get("niche", ""),
-                description=item.get("description", ""),
-                evidence=item.get("evidence", []),
-                demand_level=item.get("demand_level", "medium"),
-                suggested_product=item.get("suggested_product", ""),
-                confidence=float(item.get("confidence", 0.5)),
-            ))
+            recs.append(
+                NicheRecommendation(
+                    niche=item.get("niche", ""),
+                    description=item.get("description", ""),
+                    evidence=item.get("evidence", []),
+                    demand_level=item.get("demand_level", "medium"),
+                    suggested_product=item.get("suggested_product", ""),
+                    confidence=float(item.get("confidence", 0.5)),
+                )
+            )
+
+        recs.sort(key=lambda r: r.confidence, reverse=True)
         return recs
 
 
 def format_recommendations(recs: list[NicheRecommendation]) -> str:
+    """Format recommendations as a readable report."""
     if not recs:
         return "No recommendations generated."
-    lines = ["=" * 60, "AI NICHE RECOMMENDATIONS", "=" * 60, ""]
+
+    lines = [
+        "=" * 60,
+        "AI NICHE RECOMMENDATIONS",
+        "=" * 60,
+        "",
+    ]
+
     for i, r in enumerate(recs, 1):
-        lines.append(f"{i}. {r.niche} (confidence: {r.confidence:.0%})")
+        lines.append(f"{i}. {r.niche} [{r.demand_level} demand, {r.confidence:.0%} confidence]")
         lines.append(f"   {r.description}")
-        lines.append(f"   Demand: {r.demand_level}")
         lines.append(f"   Product idea: {r.suggested_product}")
         if r.evidence:
-            lines.append(f"   Evidence: {'; '.join(r.evidence[:3])}")
+            lines.append("   Evidence:")
+            for ev in r.evidence[:3]:
+                lines.append(f"     - {ev}")
         lines.append("")
+
     return "\n".join(lines)

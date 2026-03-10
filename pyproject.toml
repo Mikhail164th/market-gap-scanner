@@ -12,6 +12,7 @@ requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.25",
     "praw>=7.0",
+    "openai>=1.0",
 ]
 
 [project.scripts]
