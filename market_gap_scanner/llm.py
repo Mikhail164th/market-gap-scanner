@@ -1,7 +1,8 @@
 """LLM-powered market gap analysis.
 
-Uses OpenAI SDK (compatible with any OpenAI-compatible provider:
-OpenAI, Anthropic via proxy, OpenRouter, vLLM, Ollama, etc.)
+Supports multiple LLM providers:
+  - **YandexGPT** (default) — Yandex Foundation Models REST API
+  - **OpenAI** and compatible (OpenRouter, Ollama, vLLM, etc.) — via OpenAI SDK
 
 Analyzes keyword volumes + Reddit signals to generate
 actionable niche recommendations with confidence scoring.
@@ -12,10 +13,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from openai import OpenAI
+import httpx
 
 if TYPE_CHECKING:
     from .analyzer import MarketGap
@@ -23,7 +25,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gpt-4o-mini"
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
 You are a market research analyst specializing in niche discovery.
@@ -39,7 +43,7 @@ For each opportunity provide:
 5. Confidence score (0.0-1.0) based on data strength
 
 Focus on niches where demand exists but supply is insufficient. \
-Be specific and data-driven. Avoid generic recommendations."""
+Be specific and data-driven. Return valid JSON."""
 
 ANALYSIS_PROMPT_TEMPLATE = """\
 Analyze these market data sources and identify the top {max_recs} niche opportunities.
@@ -50,7 +54,7 @@ Analyze these market data sources and identify the top {max_recs} niche opportun
 ## Reddit Signals (user discussions indicating market gaps)
 {reddit_section}
 
-Return a JSON object with this structure:
+Return a JSON object:
 {{
   "recommendations": [
     {{
@@ -63,6 +67,10 @@ Return a JSON object with this structure:
     }}
   ]
 }}"""
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -77,25 +85,129 @@ class NicheRecommendation:
     confidence: float = 0.5
 
 
-class LLMAnalyzer:
-    """Market gap analyzer powered by LLM.
+# ---------------------------------------------------------------------------
+# Provider base
+# ---------------------------------------------------------------------------
 
-    Works with any OpenAI-compatible API provider.
+
+class BaseLLMProvider(ABC):
+    """Abstract LLM provider interface."""
+
+    @abstractmethod
+    def complete(self, system: str, user: str) -> str:
+        """Send a chat completion request and return the response text."""
+
+
+# ---------------------------------------------------------------------------
+# YandexGPT provider (REST API)
+# ---------------------------------------------------------------------------
+
+YANDEX_API_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
+
+class YandexGPTProvider(BaseLLMProvider):
+    """YandexGPT via Foundation Models REST API.
+
+    Auth: either IAM token or API key.
+    Model URI format: gpt://<folder_id>/<model_name>/<version>
 
     Args:
-        api_key: API key. Falls back to OPENAI_API_KEY env var.
-        base_url: API base URL. Falls back to OPENAI_BASE_URL env var.
-            Examples:
-                - https://api.openai.com/v1 (OpenAI)
-                - https://openrouter.ai/api/v1 (OpenRouter)
-                - http://localhost:11434/v1 (Ollama)
-                - http://localhost:8000/v1 (vLLM)
-        model: Model name. Falls back to LLM_MODEL env var.
+        folder_id: Yandex Cloud folder ID. Env: YC_FOLDER_ID.
+        api_key: Yandex Cloud API key. Env: YC_API_KEY.
+        iam_token: IAM token (alternative to api_key). Env: YC_IAM_TOKEN.
+        model: Model name. Default: yandexgpt-lite.
+        temperature: Generation temperature (0.0-1.0).
+        max_tokens: Maximum response tokens.
 
     Example:
-        >>> analyzer = LLMAnalyzer(api_key="sk-...", model="gpt-4o-mini")
-        >>> recs = analyzer.analyze(gaps=gaps, signals=signals)
-        >>> print(format_recommendations(recs))
+        >>> provider = YandexGPTProvider(
+        ...     folder_id="b1g...",
+        ...     api_key="AQVNxxx...",
+        ... )
+    """
+
+    def __init__(
+        self,
+        folder_id: str | None = None,
+        api_key: str | None = None,
+        iam_token: str | None = None,
+        model: str = "yandexgpt-lite",
+        version: str = "latest",
+        temperature: float = 0.3,
+        max_tokens: int = 2000,
+    ) -> None:
+        self._folder_id = folder_id or os.getenv("YC_FOLDER_ID", "")
+        self._api_key = api_key or os.getenv("YC_API_KEY")
+        self._iam_token = iam_token or os.getenv("YC_IAM_TOKEN")
+        self._model_uri = f"gpt://{self._folder_id}/{model}/{version}"
+        self._temperature = temperature
+        self._max_tokens = max_tokens
+
+        if not self._api_key and not self._iam_token:
+            raise ValueError(
+                "YandexGPT requires either api_key (YC_API_KEY) "
+                "or iam_token (YC_IAM_TOKEN)"
+            )
+
+    def complete(self, system: str, user: str) -> str:
+        headers: dict[str, str] = {}
+        if self._api_key:
+            headers["Authorization"] = f"Api-Key {self._api_key}"
+        else:
+            headers["Authorization"] = f"Bearer {self._iam_token}"
+
+        payload = {
+            "modelUri": self._model_uri,
+            "completionOptions": {
+                "stream": False,
+                "temperature": self._temperature,
+                "maxTokens": str(self._max_tokens),
+            },
+            "messages": [
+                {"role": "system", "text": system},
+                {"role": "user", "text": user},
+            ],
+        }
+
+        resp = httpx.post(
+            YANDEX_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        alternatives = data.get("result", {}).get("alternatives", [])
+        if not alternatives:
+            raise ValueError("Empty response from YandexGPT")
+
+        return alternatives[0]["message"]["text"]
+
+
+# ---------------------------------------------------------------------------
+# OpenAI provider (SDK)
+# ---------------------------------------------------------------------------
+
+
+class OpenAIProvider(BaseLLMProvider):
+    """OpenAI and compatible providers via official SDK.
+
+    Works with: OpenAI, OpenRouter, Ollama, vLLM, LM Studio, etc.
+
+    Args:
+        api_key: API key. Env: OPENAI_API_KEY.
+        base_url: API base URL. Env: OPENAI_BASE_URL.
+        model: Model name. Env: LLM_MODEL. Default: gpt-4o-mini.
+
+    Example:
+        >>> provider = OpenAIProvider(api_key="sk-...")
+        >>> # OpenRouter:
+        >>> provider = OpenAIProvider(
+        ...     api_key="sk-or-...",
+        ...     base_url="https://openrouter.ai/api/v1",
+        ...     model="deepseek/deepseek-chat",
+        ... )
     """
 
     def __init__(
@@ -104,10 +216,74 @@ class LLMAnalyzer:
         base_url: str | None = None,
         model: str | None = None,
     ) -> None:
-        self._model = model or os.getenv("LLM_MODEL", DEFAULT_MODEL)
+        from openai import OpenAI
+
+        self._model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
         self._client = OpenAI(
             api_key=api_key or os.getenv("OPENAI_API_KEY"),
             base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+        )
+
+    def complete(self, system: str, user: str) -> str:
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+        return response.choices[0].message.content or ""
+
+
+# ---------------------------------------------------------------------------
+# Main analyzer
+# ---------------------------------------------------------------------------
+
+
+class LLMAnalyzer:
+    """Market gap analyzer powered by LLM.
+
+    Auto-detects provider from environment:
+      - If YC_API_KEY or YC_IAM_TOKEN set → YandexGPT
+      - If OPENAI_API_KEY set → OpenAI
+      - Or pass provider explicitly.
+
+    Args:
+        provider: LLM provider instance. Auto-detected if None.
+
+    Example:
+        >>> # Auto-detect (YandexGPT if YC_API_KEY set)
+        >>> analyzer = LLMAnalyzer()
+        >>>
+        >>> # Explicit YandexGPT
+        >>> analyzer = LLMAnalyzer(provider=YandexGPTProvider(
+        ...     folder_id="b1g...", api_key="AQV..."
+        ... ))
+        >>>
+        >>> # Explicit OpenAI
+        >>> analyzer = LLMAnalyzer(provider=OpenAIProvider(api_key="sk-..."))
+        >>>
+        >>> recs = analyzer.analyze(gaps=gaps, signals=signals)
+        >>> print(format_recommendations(recs))
+    """
+
+    def __init__(self, provider: BaseLLMProvider | None = None) -> None:
+        self._provider = provider or self._auto_detect_provider()
+
+    @staticmethod
+    def _auto_detect_provider() -> BaseLLMProvider:
+        """Auto-detect LLM provider from environment variables."""
+        if os.getenv("YC_API_KEY") or os.getenv("YC_IAM_TOKEN"):
+            logger.info("Using YandexGPT provider")
+            return YandexGPTProvider()
+        if os.getenv("OPENAI_API_KEY"):
+            logger.info("Using OpenAI provider")
+            return OpenAIProvider()
+        raise ValueError(
+            "No LLM provider configured. Set YC_API_KEY (YandexGPT) "
+            "or OPENAI_API_KEY (OpenAI/compatible)."
         )
 
     def analyze(
@@ -128,19 +304,9 @@ class LLMAnalyzer:
         """
         prompt = self._build_prompt(gaps, signals, max_recommendations)
 
-        logger.info("Calling %s for market analysis...", self._model)
+        logger.info("Requesting LLM analysis (%s)...", type(self._provider).__name__)
+        content = self._provider.complete(SYSTEM_PROMPT, prompt)
 
-        response = self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            response_format={"type": "json_object"},
-        )
-
-        content = response.choices[0].message.content
         if not content:
             logger.warning("Empty LLM response")
             return []
@@ -153,7 +319,6 @@ class LLMAnalyzer:
         signals: list[RedditSignal] | None,
         max_recs: int,
     ) -> str:
-        # Keyword section
         kw_lines = []
         for g in gaps[:30]:
             kw_lines.append(
@@ -162,7 +327,6 @@ class LLMAnalyzer:
             )
         keyword_section = "\n".join(kw_lines) if kw_lines else "No keyword data available."
 
-        # Reddit section
         rd_lines = []
         if signals:
             for s in signals[:20]:
@@ -180,10 +344,17 @@ class LLMAnalyzer:
 
     @staticmethod
     def _parse_response(content: str) -> list[NicheRecommendation]:
+        # YandexGPT may wrap JSON in markdown code blocks
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            lines = [l for l in lines if not l.startswith("```")]
+            cleaned = "\n".join(lines)
+
         try:
-            data = json.loads(content)
+            data = json.loads(cleaned)
         except json.JSONDecodeError:
-            logger.error("Failed to parse LLM response as JSON")
+            logger.error("Failed to parse LLM response as JSON:\n%s", content[:500])
             return []
 
         recs = []
@@ -203,6 +374,11 @@ class LLMAnalyzer:
         return recs
 
 
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+
+
 def format_recommendations(recs: list[NicheRecommendation]) -> str:
     """Format recommendations as a readable report."""
     if not recs:
@@ -216,7 +392,9 @@ def format_recommendations(recs: list[NicheRecommendation]) -> str:
     ]
 
     for i, r in enumerate(recs, 1):
-        lines.append(f"{i}. {r.niche} [{r.demand_level} demand, {r.confidence:.0%} confidence]")
+        lines.append(
+            f"{i}. {r.niche} [{r.demand_level} demand, {r.confidence:.0%} confidence]"
+        )
         lines.append(f"   {r.description}")
         lines.append(f"   Product idea: {r.suggested_product}")
         if r.evidence:

@@ -149,8 +149,57 @@ MIT — см. [LICENSE](LICENSE).
 
 ## LLM-анализ (опционально)
 
-Модуль `llm.py` использует [OpenAI SDK](https://github.com/openai/openai-python) для генерации рекомендаций по нишам. Совместим с любым OpenAI-compatible провайдером (OpenAI, OpenRouter, Ollama, vLLM и др.)
+Модуль `llm.py` генерирует рекомендации по нишам на основе собранных данных. Поддерживает несколько LLM-провайдеров:
 
+### YandexGPT (по умолчанию)
+
+Используется [Yandex Foundation Models API](https://cloud.yandex.ru/docs/foundation-models/).
+
+```python
+from market_gap_scanner.llm import LLMAnalyzer, YandexGPTProvider, format_recommendations
+
+# Авто-определение провайдера из env
+analyzer = LLMAnalyzer()
+
+# Или явно
+analyzer = LLMAnalyzer(provider=YandexGPTProvider(
+    folder_id="b1g...",
+    api_key="AQVNxxx...",
+    model="yandexgpt-lite",  # или yandexgpt для полной модели
+))
+
+recs = analyzer.analyze(gaps=gaps, signals=signals)
+print(format_recommendations(recs))
+```
+
+```bash
+export YC_API_KEY="AQVNxxx..."
+export YC_FOLDER_ID="b1g..."
+```
+
+### OpenAI и совместимые
+
+Работает с OpenAI, OpenRouter, Ollama, vLLM через [OpenAI SDK](https://github.com/openai/openai-python).
+
+```python
+from market_gap_scanner.llm import LLMAnalyzer, OpenAIProvider
+
+# OpenAI
+analyzer = LLMAnalyzer(provider=OpenAIProvider(api_key="sk-..."))
+
+# OpenRouter
+analyzer = LLMAnalyzer(provider=OpenAIProvider(
+    api_key="sk-or-...",
+    base_url="https://openrouter.ai/api/v1",
+    model="deepseek/deepseek-chat",
+))
+
+# Ollama (local)
+analyzer = LLMAnalyzer(provider=OpenAIProvider(
+    api_key="ollama",
+    base_url="http://localhost:11434/v1",
+    model="llama3",
+))
 ```python
 from market_gap_scanner.llm import LLMAnalyzer, format_recommendations
 
