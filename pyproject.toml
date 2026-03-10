@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "market-gap-scanner"
 version = "0.1.0"
-description = "Keyword research and market niche analysis tool using Yandex Wordstat API and Reddit"
+description = "Market niche analysis tool: Yandex Wordstat + Reddit signals + LLM insights"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

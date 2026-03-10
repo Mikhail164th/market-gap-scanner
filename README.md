@@ -1,23 +1,19 @@
 # Market Gap Scanner
 
-Инструмент для анализа рыночных ниш с использованием нескольких источников данных:
+Инструмент для поиска рыночных ниш на основе трёх источников данных:
 
 - **Яндекс.Вордстат** — объём поисковых запросов через API Яндекс.Директа
 - **Reddit** — сигналы рынка из обсуждений (жалобы, запросы, поиск альтернатив)
-
-Сканирует спрос, находит незанятые ниши и выявляет рыночные пробелы.
+- **LLM** — AI-анализ собранных данных и генерация рекомендаций (YandexGPT / OpenAI)
 
 ## Возможности
 
-### Wordstat (Яндекс)
-- Получение статистики показов по ключевым словам через Yandex Direct API v4
-- Автоматический gap-scoring: спрос vs конкуренция
-- Батч-обработка (до 10 фраз за запрос), геотаргетинг
-
-### Reddit
-- Сбор сигналов из тематических сабреддитов через Reddit API (PRAW)
-- Классификация: `unmet_demand`, `pain_point`, `competitor_dissatisfaction`, `feature_request`
-- Фильтрация по ключевым словам ("looking for", "alternative to", "frustrated with" и др.)
+| Модуль | Источник | Что делает |
+|--------|----------|------------|
+| `wordstat.py` | Yandex Direct API v4 | Получает объёмы поисковых запросов, батч-обработка до 10 фраз |
+| `reddit.py` | Reddit API (PRAW) | Собирает сигналы: `unmet_demand`, `pain_point`, `feature_request` |
+| `analyzer.py` | — | Gap-scoring: demand / supply ratio |
+| `llm.py` | YandexGPT / OpenAI | AI-рекомендации по нишам на основе собранных данных |
 
 ## Установка
 
@@ -25,52 +21,54 @@
 pip install -e .
 ```
 
-## Использование
+## Быстрый старт
 
-### Анализ ключевых слов (Wordstat)
+### CLI
 
 ```bash
-market-gap-scanner "crm для фрилансеров" "автоматизация бизнеса" --token YOUR_YANDEX_TOKEN
+# Только Wordstat
+market-gap-scanner "crm для фрилансеров" "автоматизация бизнеса" \
+    --token YOUR_YANDEX_TOKEN
+
+# Wordstat + Reddit
+market-gap-scanner "crm для фрилансеров" \
+    --token YOUR_YANDEX_TOKEN \
+    --reddit-id YOUR_CLIENT_ID \
+    --reddit-secret YOUR_CLIENT_SECRET
+
+# Полный пайплайн: Wordstat + Reddit + LLM
+market-gap-scanner "crm для фрилансеров" \
+    --token YOUR_YANDEX_TOKEN \
+    --reddit-id YOUR_CLIENT_ID \
+    --reddit-secret YOUR_CLIENT_SECRET \
+    --llm
 ```
 
-### Сбор Reddit-сигналов
-
-```python
-from market_gap_scanner.reddit import RedditCollector, format_signals
-
-collector = RedditCollector(
-    client_id="YOUR_CLIENT_ID",
-    client_secret="YOUR_CLIENT_SECRET",
-)
-
-signals = collector.collect_signals(
-    subreddits=["SaaS", "startups", "Entrepreneur"],
-    time_filter="week",
-)
-
-print(format_signals(signals))
-```
-
-### Комбинированный анализ
+### Python API
 
 ```python
 import asyncio
 from market_gap_scanner.wordstat import WordstatClient
 from market_gap_scanner.reddit import RedditCollector
 from market_gap_scanner.analyzer import analyze_gaps
+from market_gap_scanner.llm import LLMAnalyzer, format_recommendations
 
 async def full_scan():
-    # 1. Get keyword volumes from Wordstat
+    # 1. Keyword volumes from Wordstat
     async with WordstatClient(token="YOUR_TOKEN") as ws:
         keyword_data = await ws.get_keyword_stats(["crm freelancer", "task automation"])
 
-    # 2. Collect Reddit signals
+    # 2. Reddit signals
     reddit = RedditCollector(client_id="...", client_secret="...")
-    signals = reddit.collect_signals(keywords=["crm", "automation", "freelancer"])
+    signals = reddit.collect_signals(keywords=["crm", "automation"])
 
-    # 3. Analyze gaps
+    # 3. Gap analysis
     gaps = analyze_gaps(keyword_data)
-    print(f"Found {len(gaps)} market gaps and {len(signals)} Reddit signals")
+
+    # 4. LLM recommendations
+    analyzer = LLMAnalyzer()  # auto-detects provider from env
+    recs = analyzer.analyze(gaps=gaps, signals=signals)
+    print(format_recommendations(recs))
 
 asyncio.run(full_scan())
 ```
@@ -78,21 +76,59 @@ asyncio.run(full_scan())
 ## Получение API-ключей
 
 ### Яндекс Wordstat
+
 1. Зарегистрируйте приложение: [OAuth Яндекса](https://oauth.yandex.ru/)
-2. Получите доступ к API Директа
+2. Подайте заявку на доступ к API Директа
 3. Получите OAuth-токен
 
 ### Reddit
+
 1. Создайте приложение: [Reddit Apps](https://www.reddit.com/prefs/apps)
 2. Тип: `script`
 3. Скопируйте `client_id` и `client_secret`
 
-## Схема работы
+### LLM-провайдеры
+
+**YandexGPT** (приоритет по умолчанию):
+```bash
+export YC_API_KEY="AQVNxxx..."
+export YC_FOLDER_ID="b1g..."
+```
+
+**OpenAI и совместимые** (OpenRouter, Ollama, vLLM):
+```bash
+export OPENAI_API_KEY="sk-..."
+export OPENAI_BASE_URL="https://openrouter.ai/api/v1"  # опционально
+export LLM_MODEL="gpt-4o-mini"  # опционально
+```
+
+Провайдер определяется автоматически: если задан `YC_API_KEY` → YandexGPT, иначе `OPENAI_API_KEY` → OpenAI.
+
+Можно задать явно:
+
+```python
+from market_gap_scanner.llm import LLMAnalyzer, YandexGPTProvider, OpenAIProvider
+
+# YandexGPT
+analyzer = LLMAnalyzer(provider=YandexGPTProvider(
+    folder_id="b1g...", api_key="AQV...", model="yandexgpt-lite",
+))
+
+# OpenAI
+analyzer = LLMAnalyzer(provider=OpenAIProvider(api_key="sk-..."))
+
+# Ollama (local)
+analyzer = LLMAnalyzer(provider=OpenAIProvider(
+    api_key="ollama", base_url="http://localhost:11434/v1", model="llama3",
+))
+```
+
+## Архитектура
 
 ```
 ┌─────────────────┐     ┌──────────────────┐
-│  Yandex Wordstat│     │     Reddit API   │
-│  (Direct API v4)│     │     (PRAW)       │
+│  Yandex Wordstat│     │   Reddit API     │
+│  (Direct API v4)│     │   (PRAW)         │
 └────────┬────────┘     └────────┬─────────┘
          │                       │
          ▼                       ▼
@@ -100,17 +136,24 @@ asyncio.run(full_scan())
    (shows/month)        (discussions, complaints)
          │                       │
          └───────────┬───────────┘
+                     │
                      ▼
               Gap Analyzer
          (score = demand / supply)
                      │
                      ▼
-              Market Gaps Report
+              ┌──────────────┐
+              │  LLM Engine  │
+              │ (YandexGPT / │
+              │   OpenAI)    │
+              └──────┬───────┘
+                     │
+                     ▼
+           Niche Recommendations
 ```
 
 ## Пример вывода
 
-### Wordstat
 ```
 ============================================================
 MARKET GAP ANALYSIS REPORT
@@ -122,10 +165,7 @@ MARKET GAP ANALYSIS REPORT
      Related: учет клиентов фрилансер, crm бесплатно
 
 Total opportunities found: 1
-```
 
-### Reddit
-```
 ============================================================
 REDDIT MARKET SIGNALS REPORT
 ============================================================
@@ -136,6 +176,17 @@ REDDIT MARKET SIGNALS REPORT
      Keywords: looking for, crm
 
 Total signals: 15
+
+============================================================
+AI NICHE RECOMMENDATIONS
+============================================================
+
+1. CRM для фрилансеров [high demand, 85% confidence]
+   Высокий спрос (2,450 запросов/мес) при отсутствии специализированного решения
+   Product idea: Легковесный CRM с треком проектов, инвойсингом и простым UI
+   Evidence:
+     - 2,450 поисковых запросов/мес по "crm для фрилансеров"
+     - Reddit: активный поиск альтернатив в r/SaaS и r/Entrepreneur
 ```
 
 ## Лицензия
@@ -144,89 +195,6 @@ MIT — см. [LICENSE](LICENSE).
 
 ## Благодарности
 
-- [Yandex.Wordstat-parser](https://github.com/ne-coding/Yandex.Wordstat-parser) (MIT) — за базовый паттерн работы с API
+- [Yandex.Wordstat-parser](https://github.com/ne-coding/Yandex.Wordstat-parser) (MIT) — паттерн работы с Direct API
 - [PRAW](https://praw.readthedocs.io/) — Python Reddit API Wrapper
-
-## LLM-анализ (опционально)
-
-Модуль `llm.py` генерирует рекомендации по нишам на основе собранных данных. Поддерживает несколько LLM-провайдеров:
-
-### YandexGPT (по умолчанию)
-
-Используется [Yandex Foundation Models API](https://cloud.yandex.ru/docs/foundation-models/).
-
-```python
-from market_gap_scanner.llm import LLMAnalyzer, YandexGPTProvider, format_recommendations
-
-# Авто-определение провайдера из env
-analyzer = LLMAnalyzer()
-
-# Или явно
-analyzer = LLMAnalyzer(provider=YandexGPTProvider(
-    folder_id="b1g...",
-    api_key="AQVNxxx...",
-    model="yandexgpt-lite",  # или yandexgpt для полной модели
-))
-
-recs = analyzer.analyze(gaps=gaps, signals=signals)
-print(format_recommendations(recs))
-```
-
-```bash
-export YC_API_KEY="AQVNxxx..."
-export YC_FOLDER_ID="b1g..."
-```
-
-### OpenAI и совместимые
-
-Работает с OpenAI, OpenRouter, Ollama, vLLM через [OpenAI SDK](https://github.com/openai/openai-python).
-
-```python
-from market_gap_scanner.llm import LLMAnalyzer, OpenAIProvider
-
-# OpenAI
-analyzer = LLMAnalyzer(provider=OpenAIProvider(api_key="sk-..."))
-
-# OpenRouter
-analyzer = LLMAnalyzer(provider=OpenAIProvider(
-    api_key="sk-or-...",
-    base_url="https://openrouter.ai/api/v1",
-    model="deepseek/deepseek-chat",
-))
-
-# Ollama (local)
-analyzer = LLMAnalyzer(provider=OpenAIProvider(
-    api_key="ollama",
-    base_url="http://localhost:11434/v1",
-    model="llama3",
-))
-```python
-from market_gap_scanner.llm import LLMAnalyzer, format_recommendations
-
-# OpenAI
-analyzer = LLMAnalyzer(api_key="sk-...", model="gpt-4o-mini")
-
-# OpenRouter
-analyzer = LLMAnalyzer(
-    api_key="sk-or-...",
-    base_url="https://openrouter.ai/api/v1",
-    model="deepseek/deepseek-chat",
-)
-
-# Ollama (local)
-analyzer = LLMAnalyzer(
-    api_key="ollama",
-    base_url="http://localhost:11434/v1",
-    model="llama3",
-)
-
-recs = analyzer.analyze(gaps=gaps, signals=signals)
-print(format_recommendations(recs))
-```
-
-Также поддерживает конфигурацию через переменные окружения:
-```bash
-export OPENAI_API_KEY="sk-..."
-export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
-export LLM_MODEL="gpt-4o-mini"
-```
+- [OpenAI Python SDK](https://github.com/openai/openai-python) — LLM integration
