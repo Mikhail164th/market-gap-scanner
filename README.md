@@ -146,3 +146,17 @@ MIT — см. [LICENSE](LICENSE).
 
 - [Yandex.Wordstat-parser](https://github.com/ne-coding/Yandex.Wordstat-parser) (MIT) — за базовый паттерн работы с API
 - [PRAW](https://praw.readthedocs.io/) — Python Reddit API Wrapper
+
+## LLM-анализ (опционально)
+
+Модуль `llm.py` использует OpenAI-совместимый API для генерации рекомендаций по нишам на основе собранных данных:
+
+```python
+from market_gap_scanner.llm import LLMAnalyzer, format_recommendations
+
+async with LLMAnalyzer(api_key="sk-...", model="gpt-4o-mini") as llm:
+    recs = await llm.analyze(gaps=gaps, signals=signals)
+    print(format_recommendations(recs))
+```
+
+Поддерживает любой OpenAI-совместимый провайдер через `base_url`.
